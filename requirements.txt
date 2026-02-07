@@ -1,0 +1,8 @@
+gradio>=4.0.0
+requests>=2.28.0
+python-dotenv>=1.0.0
+dashscope>=1.23.4
+# Optional: for TTS real-time playback. Without it, TTS still works (plays via afplay when done).
+# On macOS install PortAudio first:  brew install portaudio
+# Then:  pip install pyaudio
+# pyaudio>=0.2.14
