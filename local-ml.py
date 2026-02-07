@@ -105,6 +105,49 @@ def _strip_parenthetical_for_tts(text: str) -> str:
     return s.strip()
 
 
+def _strip_complete_round_parens(text: str) -> str:
+    """Remove complete round-bracket pairs （）() and mixed; leaves unpaired brackets."""
+    if not text:
+        return ""
+    s = str(text)
+    for _ in range(20):
+        prev = s
+        s = re.sub(r"\([^()]*\)", "", s)
+        s = re.sub(r"（[^（）]*）", "", s)
+        s = re.sub(r"[（(][^）)]*[）)]", "", s)
+        if s == prev:
+            break
+    return s
+
+
+def _process_segment_for_tts(seg: str, inside_parens: bool) -> tuple[str, bool]:
+    """
+    Process one TTS segment with cross-segment parenthesis state.
+    Case 1: segment has complete () pairs -> strip them, send the rest.
+    Case 2: segment has unclosed （ or ( -> send only before first such; set inside_parens.
+    When inside_parens: skip until first ） or ), then send content after; clear state.
+    Returns (text_to_send, new_inside_parens).
+    """
+    if not seg:
+        return "", inside_parens
+    if inside_parens:
+        for i, c in enumerate(seg):
+            if c in "）)":
+                after = _strip_complete_round_parens(seg[i + 1 :])
+                idx_open = next((j for j, ch in enumerate(after) if ch in "（("), -1)
+                if idx_open >= 0:
+                    to_send = after[:idx_open].strip()
+                    return (to_send, True) if to_send else ("", True)
+                return (after.strip(), False) if after.strip() else ("", False)
+        return "", True
+    s = _strip_complete_round_parens(seg)
+    idx_open = next((j for j, ch in enumerate(s) if ch in "（("), -1)
+    if idx_open >= 0:
+        to_send = s[:idx_open].strip()
+        return (to_send, True) if to_send else ("", True)
+    return (s.strip(), False) if s.strip() else ("", False)
+
+
 def _split_next_tts_segment(buffer: str) -> tuple[str, str]:
     """
     从 buffer 中取出下一段用于 TTS 的文本（到句号/问号/感叹号/换行或长度上限），
@@ -465,6 +508,7 @@ def stream_chat(
     tts_push = None
     tts_finish = None
     tts_buffer = ""
+    tts_inside_parens = False
     tts_total_chars = 0
     api_key = (tts_api_key or "").strip() or (os.environ.get("DASHSCOPE_API_KEY") or "").strip() or ""
     # #region agent log
@@ -501,9 +545,10 @@ def stream_chat(
                     if not seg:
                         break
                     tts_buffer = remaining
-                    tts_total_chars += len(seg)
-                    if tts_total_chars <= TTS_CUMULATIVE_CHAR_LIMIT:
-                        tts_push(seg)
+                    to_send, tts_inside_parens = _process_segment_for_tts(seg, tts_inside_parens)
+                    if to_send and tts_total_chars <= TTS_CUMULATIVE_CHAR_LIMIT:
+                        tts_total_chars += len(to_send)
+                        tts_push(to_send)
                 status = "语音播放中…"
             else:
                 status = _tts_status()
@@ -512,8 +557,11 @@ def stream_chat(
             continue
 
     if tts_finish is not None:
-        if tts_buffer.strip() and tts_total_chars <= TTS_CUMULATIVE_CHAR_LIMIT:
-            tts_push(tts_buffer.strip())
+        last_seg = tts_buffer.strip()
+        if last_seg:
+            to_send, _ = _process_segment_for_tts(last_seg, tts_inside_parens)
+            if to_send and tts_total_chars <= TTS_CUMULATIVE_CHAR_LIMIT:
+                tts_push(to_send)
         wav_path = tts_finish()
         if wav_path is None and full.strip() and api_key:
             if _tts_sync_one_shot(full.strip(), api_key):
