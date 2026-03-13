@@ -27,6 +27,7 @@ _env_file = _env_dir / ".env"
 _dlog("after load_dotenv", {"script_dir": str(_env_dir), "env_file_exists": _env_file.exists(), "cwd": str(Path.cwd()), "cwd_env_exists": (Path.cwd() / ".env").exists(), "DASHSCOPE_API_KEY_set": bool((os.environ.get("DASHSCOPE_API_KEY") or "").strip())}, "H1")
 # #endregion
 
+import base64
 import queue
 import re
 import struct
@@ -47,6 +48,12 @@ TTS_SENTENCE_MAX_CHARS = 200   # max chars per segment when no sentence end foun
 TTS_SAMPLE_RATE = 22050        # PCM playback rate for CosyVoice default
 _SCRIPT_DIR = Path(__file__).resolve().parent
 TTS_OUTPUT_WAV = str(_SCRIPT_DIR / "last_tts.wav")  # 固定路径，界面可点击播放
+
+# 局域网 TTS（MLX 兼容接口）
+LAN_TTS_DEFAULT_URL = "http://192.168.31.134:9000/v1/audio/speech"
+LAN_TTS_MODEL = "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"
+LAN_TTS_MAX_SEGMENT_CHARS = 800   # 单段上限，减少切碎
+LAN_TTS_SENTENCE_MAX_CHARS = 400  # 无句末时截断长度
 
 
 def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int = TTS_SAMPLE_RATE) -> bytes:
@@ -148,32 +155,35 @@ def _process_segment_for_tts(seg: str, inside_parens: bool) -> tuple[str, bool]:
     return (s.strip(), False) if s.strip() else ("", False)
 
 
-def _split_next_tts_segment(buffer: str) -> tuple[str, str]:
+def _split_next_tts_segment(
+    buffer: str,
+    max_segment_chars: int | None = None,
+    sentence_max_chars: int | None = None,
+) -> tuple[str, str]:
     """
     从 buffer 中取出下一段用于 TTS 的文本（到句号/问号/感叹号/换行或长度上限），
-    返回 (segment, remaining)。单段不超过 TTS_MAX_SEGMENT_CHARS。
+    返回 (segment, remaining)。单段不超过 max_segment_chars（默认 TTS_MAX_SEGMENT_CHARS）。
     """
+    max_seg = max_segment_chars if max_segment_chars is not None else TTS_MAX_SEGMENT_CHARS
+    sent_max = sentence_max_chars if sentence_max_chars is not None else TTS_SENTENCE_MAX_CHARS
     if not buffer or not buffer.strip():
         return "", ""
     s = buffer.strip()
-    if len(s) <= TTS_MAX_SEGMENT_CHARS:
-        # 找最后一个句末标点或换行
+    if len(s) <= max_seg:
         for sep in ("。", "！", "？", "!", "?", ".", "\n"):
             i = s.rfind(sep)
             if i != -1:
                 return s[: i + 1].strip(), s[i + 1 :].strip()
-        # 无句末则整段送出（短时）或按长度截断
-        if len(s) <= TTS_SENTENCE_MAX_CHARS:
+        if len(s) <= sent_max:
             return s, ""
-        seg = s[:TTS_SENTENCE_MAX_CHARS]
-        return seg, s[TTS_SENTENCE_MAX_CHARS:].strip()
-    # 超长：先截 TTS_MAX_SEGMENT_CHARS，再在截断内找最后句末
-    chunk = s[:TTS_MAX_SEGMENT_CHARS]
+        seg = s[:sent_max]
+        return seg, s[sent_max:].strip()
+    chunk = s[:max_seg]
     for sep in ("。", "！", "？", "!", "?", ".", "\n"):
         i = chunk.rfind(sep)
         if i != -1:
             return chunk[: i + 1].strip(), s[i + 1 :].strip()
-    seg = chunk[:TTS_SENTENCE_MAX_CHARS]
+    seg = chunk[:sent_max]
     return seg, s[len(seg) :].strip()
 
 
@@ -185,8 +195,87 @@ def _play_wav_file(wav_path: str) -> None:
             subprocess.run(["afplay", wav_path], check=True, timeout=300, capture_output=True)
         elif sys.platform.startswith("linux"):
             subprocess.run(["aplay", "-q", wav_path], check=True, timeout=300, capture_output=True)
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pass
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        _dlog("TTS playback failed", {"path": wav_path, "error": str(type(e).__name__), "message": str(e)}, "play_wav")
+
+
+def _tts_lan_one_segment(text: str, url: str, voice: str = "", instruction_prompt: str = "") -> bool:
+    """局域网 TTS：对一段文本请求 WAV，写入临时文件并播放。CustomVoice 支持 extra_body.instruction_prompt。"""
+    if not text or not url:
+        return False
+    text = _strip_parenthetical_for_tts(text)
+    if not text:
+        return False
+    body: dict = {
+        "model": LAN_TTS_MODEL,
+        "input": text,
+        "response_format": "wav",
+        "speed": 1.0,
+    }
+    if (voice or "").strip():
+        body["voice"] = voice.strip()
+    if (instruction_prompt or "").strip():
+        body["extra_body"] = {"instruction_prompt": instruction_prompt.strip()}
+    try:
+        r = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=60,
+        )
+        content_type = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        raw = r.content
+        _dlog("LAN TTS response", {"url": url, "status": r.status_code, "content_type": content_type, "len": len(raw), "first_bytes": raw[:20].hex() if len(raw) >= 20 else raw.hex()}, "lan_tts")
+        r.raise_for_status()
+        wav_bytes = raw
+        if len(raw) >= 1 and raw[:1] == b"{":
+            try:
+                body = json.loads(raw.decode("utf-8"))
+                b64 = body.get("audio") or body.get("data") or body.get("content")
+                if b64 is not None:
+                    wav_bytes = base64.b64decode(b64)
+                    _dlog("LAN TTS decoded base64", {"decoded_len": len(wav_bytes)}, "lan_tts")
+            except Exception as e:
+                _dlog("LAN TTS JSON/base64 decode failed", {"error": str(e), "preview": raw[:200]}, "lan_tts")
+                return False
+        if len(wav_bytes) < 100:
+            _dlog("LAN TTS audio too short", {"len": len(wav_bytes)}, "lan_tts")
+            return False
+        if wav_bytes[:4] != b"RIFF":
+            _dlog("LAN TTS not WAV (no RIFF)", {"first4": wav_bytes[:4].hex()}, "lan_tts")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(wav_bytes)
+            path = f.name
+        _play_wav_file(path)
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        return True
+    except requests.RequestException as e:
+        resp = getattr(e, "response", None)
+        _dlog("LAN TTS request failed", {"url": url, "error": str(e), "response_preview": (resp.text[:300] if resp is not None else None)}, "lan_tts")
+        return False
+    except Exception as e:
+        _dlog("LAN TTS error", {"url": url, "error": str(type(e).__name__), "message": str(e)}, "lan_tts")
+        return False
+
+
+def _tts_lan_sender_worker(segment_queue: queue.Queue, lan_url: str, lan_voice: str = "", lan_instruction: str = "") -> None:
+    """从 segment_queue 取段，逐段调用局域网 TTS 并播放。"""
+    while True:
+        try:
+            seg = segment_queue.get(timeout=30)
+        except queue.Empty:
+            continue
+        if seg is None:
+            break
+        cleaned = _strip_parenthetical_for_tts(seg)
+        if cleaned:
+            _dlog("LAN TTS segment", {"len": len(cleaned), "preview": cleaned[:50]}, "lan_tts")
+            _tts_lan_one_segment(cleaned, lan_url, voice=lan_voice, instruction_prompt=lan_instruction)
+        else:
+            _dlog("LAN TTS segment empty after clean", {"orig_len": len(seg)}, "lan_tts")
 
 
 def _tts_playback_worker(
@@ -373,11 +462,32 @@ def _tts_sync_one_shot(text: str, api_key: str) -> bool:
         return False
 
 
-def _start_tts_session(api_key: str):
+def _start_tts_session(api_key: str, tts_backend: str = "dashscope", lan_tts_url: str = "", lan_tts_voice: str = "", lan_tts_instruction: str = ""):
     """
-    Start TTS for one reply: playback thread + sender thread.
+    Start TTS for one reply: playback thread + sender thread (or LAN sender only).
     Returns (push_segment_fn, finish_fn). finish_fn() returns path to WAV (or None).
     """
+    if tts_backend == "lan" and ((lan_tts_url or "").strip() or LAN_TTS_DEFAULT_URL):
+        url = (lan_tts_url or "").strip() or LAN_TTS_DEFAULT_URL
+        segment_queue = queue.Queue()
+        sender = threading.Thread(
+            target=_tts_lan_sender_worker,
+            args=(segment_queue, url, (lan_tts_voice or "").strip(), (lan_tts_instruction or "").strip()),
+            daemon=True,
+        )
+        sender.start()
+
+        def push_segment(text: str) -> None:
+            if text and text.strip():
+                segment_queue.put(text.strip())
+
+        def finish() -> str | None:
+            segment_queue.put(None)
+            sender.join(timeout=60)
+            return None
+
+        return push_segment, finish
+
     segment_queue = queue.Queue()
     audio_queue = queue.Queue()
     stop_event = threading.Event()
@@ -467,6 +577,10 @@ def stream_chat(
     message: str,
     enable_tts: bool = False,
     tts_api_key: str = "",
+    tts_backend: str = "dashscope",
+    lan_tts_url: str = "",
+    lan_tts_voice: str = "",
+    lan_tts_instruction: str = "",
 ):
     """Send request to MLX server and stream reply; yield (history, '', tts_status) for Gradio."""
     if not (message or message.strip()):
@@ -511,18 +625,29 @@ def stream_chat(
     tts_inside_parens = False
     tts_total_chars = 0
     api_key = (tts_api_key or "").strip() or (os.environ.get("DASHSCOPE_API_KEY") or "").strip() or ""
+    use_lan = (tts_backend or "dashscope").strip().lower() == "lan"
+    lan_url = (lan_tts_url or "").strip() or LAN_TTS_DEFAULT_URL
     # #region agent log
-    _dlog("TTS api_key resolution", {"enable_tts": enable_tts, "has_ui_key": bool((tts_api_key or "").strip()), "env_has_key": bool((os.environ.get("DASHSCOPE_API_KEY") or "").strip()), "api_key_non_empty": bool(api_key)}, "H5")
+    _dlog("TTS api_key resolution", {"enable_tts": enable_tts, "tts_backend": tts_backend, "use_lan": use_lan, "has_ui_key": bool((tts_api_key or "").strip()), "env_has_key": bool((os.environ.get("DASHSCOPE_API_KEY") or "").strip()), "api_key_non_empty": bool(api_key)}, "H5")
     # #endregion
-    if enable_tts and api_key:
-        try:
-            tts_push, tts_finish = _start_tts_session(api_key)
-        except Exception:
-            tts_push = None
-            tts_finish = None
+    if enable_tts:
+        if use_lan:
+            try:
+                tts_push, tts_finish = _start_tts_session("", tts_backend="lan", lan_tts_url=lan_url, lan_tts_voice=lan_tts_voice, lan_tts_instruction=lan_tts_instruction)
+            except Exception:
+                tts_push = None
+                tts_finish = None
+        elif api_key:
+            try:
+                tts_push, tts_finish = _start_tts_session(api_key, tts_backend="dashscope")
+            except Exception:
+                tts_push = None
+                tts_finish = None
 
     def _tts_status() -> str:
         if enable_tts and tts_push is None:
+            if use_lan:
+                return "局域网 TTS 暂时不可用"
             return "TTS 未配置 Key（请设置 DASHSCOPE_API_KEY 或填写 API Key）" if not api_key else "TTS 暂时不可用"
         return "语音播放中…" if tts_push else ""
 
@@ -541,7 +666,11 @@ def stream_chat(
             if tts_push is not None:
                 tts_buffer += part
                 while True:
-                    seg, remaining = _split_next_tts_segment(tts_buffer)
+                    seg, remaining = _split_next_tts_segment(
+                        tts_buffer,
+                        LAN_TTS_MAX_SEGMENT_CHARS if use_lan else None,
+                        LAN_TTS_SENTENCE_MAX_CHARS if use_lan else None,
+                    )
                     if not seg:
                         break
                     tts_buffer = remaining
@@ -563,7 +692,7 @@ def stream_chat(
             if to_send and tts_total_chars <= TTS_CUMULATIVE_CHAR_LIMIT:
                 tts_push(to_send)
         wav_path = tts_finish()
-        if wav_path is None and full.strip() and api_key:
+        if wav_path is None and full.strip() and not use_lan and api_key:
             if _tts_sync_one_shot(full.strip(), api_key):
                 wav_path = TTS_OUTPUT_WAV
         yield _tuples_to_messages(tuples + [[message.strip(), full]]), "", "准备就绪。可点击下方播放语音", wav_path
@@ -603,10 +732,34 @@ def main():
                 file_input = gr.File(label="Load from file (.txt)", file_types=[".txt"])
                 file_input.change(load_prompt_from_file, inputs=[file_input], outputs=[character_prompt])
                 enable_tts = gr.Checkbox(label="Enable TTS (streaming voice)", value=False)
-                tts_api_key = gr.Textbox(
-                    label="DashScope API Key（TTS 语音）",
-                    placeholder="填入阿里云 DashScope API Key 即可使用 TTS；不填则使用 .env 中的 DASHSCOPE_API_KEY",
-                    type="password",
+                with gr.Accordion("TTS 设置", open=True, visible=False) as tts_accordion:
+                    tts_backend = gr.Radio(
+                        choices=[("DashScope CosyVoice", "dashscope"), ("局域网 TTS (MLX)", "lan")],
+                        value="lan",
+                        label="TTS 后端",
+                    )
+                    tts_api_key = gr.Textbox(
+                        label="DashScope API Key（仅 CosyVoice 需要）",
+                        placeholder="填入阿里云 DashScope API Key；不填则使用 .env 中的 DASHSCOPE_API_KEY",
+                        type="password",
+                    )
+                    lan_tts_url = gr.Textbox(
+                        label="局域网 TTS URL（仅当选择「局域网 TTS」时使用）",
+                        placeholder=LAN_TTS_DEFAULT_URL,
+                        value=LAN_TTS_DEFAULT_URL,
+                    )
+                    lan_tts_voice = gr.Textbox(
+                        label="局域网 TTS 音色（voice）",
+                        placeholder="可选，如 female/male 或模型文档中的音色名",
+                    )
+                    lan_tts_instruction = gr.Textbox(
+                        label="局域网 TTS 风格（instruction_prompt）",
+                        placeholder="用活泼的年轻女性声音，语气开心带点笑意",
+                    )
+                enable_tts.change(
+                    lambda on: gr.update(visible=on, open=on),
+                    inputs=[enable_tts],
+                    outputs=[tts_accordion],
                 )
 
             with gr.Column(scale=2):
@@ -616,13 +769,21 @@ def main():
                 tts_status = gr.Textbox(label="TTS status", value="", interactive=False, visible=True)
                 tts_audio = gr.Audio(label="播放语音", type="filepath", visible=True)
 
-        def submit(user_msg, hist, prompt, tts_on, tts_key):
-            for h, m, s, audio_path in stream_chat(prompt, hist, user_msg, enable_tts=tts_on, tts_api_key=tts_key or ""):
+        def submit(user_msg, hist, prompt, tts_on, tts_key, tts_backend_val, lan_url, lan_voice, lan_instruction):
+            for h, m, s, audio_path in stream_chat(
+                prompt, hist, user_msg,
+                enable_tts=tts_on,
+                tts_api_key=tts_key or "",
+                tts_backend=tts_backend_val or "dashscope",
+                lan_tts_url=lan_url or "",
+                lan_tts_voice=lan_voice or "",
+                lan_tts_instruction=lan_instruction or "",
+            ):
                 yield h, m, s, audio_path
 
         msg.submit(
             submit,
-            inputs=[msg, chatbot, character_prompt, enable_tts, tts_api_key],
+            inputs=[msg, chatbot, character_prompt, enable_tts, tts_api_key, tts_backend, lan_tts_url, lan_tts_voice, lan_tts_instruction],
             outputs=[chatbot, msg, tts_status, tts_audio],
         )
         clear_btn.click(clear_chat, outputs=[chatbot])

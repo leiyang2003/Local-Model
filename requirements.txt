@@ -2,6 +2,8 @@ gradio>=4.0.0
 requests>=2.28.0
 python-dotenv>=1.0.0
 dashscope>=1.23.4
+# Optional: for vector memory search (set MEMORY_SEARCH_ENABLED=1 and OPENAI_API_KEY)
+openai>=1.0.0
 # Optional: for TTS real-time playback. Without it, TTS still works (plays via afplay when done).
 # On macOS install PortAudio first:  brew install portaudio
 # Then:  pip install pyaudio

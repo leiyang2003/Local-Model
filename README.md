@@ -48,14 +48,30 @@ DASHSCOPE_API_KEY=your_dashscope_api_key_here
 
 2. Start the chat UI:
    ```bash
-   python local-ml.py
+   python ChatBot_OpenClaw.py
    ```
+   (Or `python local-ml.py` for the minimal UI without memory/skills.)
 
 3. Open the Gradio URL (e.g. `http://127.0.0.1:7860`), load a character prompt (e.g. `Ani.txt`) if needed, and chat.
 
 ## Character prompts
 
 Place system/persona text in `.txt` files (e.g. `Ani.txt`). The UI lets you select a file to use as the system prompt for the chat.
+
+## Long-term memory and skills (OpenClaw-style)
+
+- **Workspace**: Memory and skills live under `workspace/` (or set `CHATBOT_WORKSPACE` to another path).
+- **Memory (read)**: Each turn injects into context either:
+  - **Full load**: `workspace/MEMORY.md` plus today’s and yesterday’s `workspace/memory/YYYY-MM-DD.md`, truncated to `MEMORY_MAX_CONTEXT_CHARS` (default 4000).
+  - **Vector search** (optional): If “Use vector memory search” is on and `OPENAI_API_KEY` is set, the app embeds memory chunks and the current message, then injects only the top-k relevant snippets. Requires `openai` and an index (built on first use or after memory writes).
+- **Memory (write)**: Automatically when (1) the user says something like “记住…” / “remember this”, or (2) history length exceeds `MEMORY_FLUSH_HISTORY_TURNS` (default 20) or estimated tokens exceed `MEMORY_FLUSH_ESTIMATED_TOKENS` (default 8000). A non-streaming call extracts content and appends to `MEMORY.md` and/or `memory/YYYY-MM-DD.md`.
+- **Skills**: Put skill folders under `workspace/skills/`; each skill is a directory with `SKILL.md` (YAML frontmatter: `name`, `description`; optional `metadata.openclaw.requires.env` for gating). The app injects an “Available skills” list into the system prompt. Example: `workspace/skills/reminder/SKILL.md`.
+
+**Skill script execution (optional)**  
+When enabled (UI checkbox “Allow skill script execution” or `SKILL_EXEC_ENABLED=1`), the model can request running a skill script by outputting `[[SKILL:<name>]]` … `[[/SKILL]]` with `key=value` args. Only skills under `workspace/skills/` that declare a `script` in `SKILL.md` are run (allowlist). Script run timeout: `SKILL_EXEC_TIMEOUT` (seconds, default 300).
+
+**Env (optional)**  
+`CHATBOT_WORKSPACE`, `MEMORY_MAX_CONTEXT_CHARS`, `MEMORY_FLUSH_HISTORY_TURNS`, `MEMORY_FLUSH_ESTIMATED_TOKENS`, `MEMORY_SEARCH_ENABLED` (1/true/yes), `MEMORY_EMBEDDING_PROVIDER` (openai), `OPENAI_API_KEY`, `MEMORY_INDEX_PATH`, `MEMORY_MAX_RESULTS`, `MEMORY_MAX_SNIPPET_CHARS`, `SKILL_EXEC_ENABLED` (1/true/yes), `SKILL_EXEC_TIMEOUT` (seconds).
 
 ## Optional: real-time TTS playback
 
